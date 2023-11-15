@@ -28,16 +28,14 @@ uint httpIndex=0;
 bool APrunning=0;
 bool LCDStartDone=0;
 
-byte customCharZ[8] = { // ż
-    0b00100,
-    0b00000,
-    0b11111,
-    0b00010,
-    0b00100,
-    0b01000,
-    0b11111,
-    0b00000
-  };
+// LCD
+char LCDcontent[4][21] = {
+  "   Oczekiwanie na   ",
+  "     polaczenie     ",
+  "        ...         ",
+  "                    "
+};
+byte customCharZ[8] = {4,0,31,2,4,8,31,0}; // ż
 
 void taskPrint(void *parameter);
 void scanI2C(void *parameter);
@@ -95,6 +93,8 @@ void LCDCtrl(void *parameter){
 
 // LCD starting message
 void LCDStart(void *parameter){
+  // memset(LCDcontent, ' ', sizeof(LCDcontent));
+
   lcd.begin(20, 4);
   lcd.createChar(0, customCharZ);
 
@@ -110,11 +110,20 @@ void LCDStart(void *parameter){
 
   delay(2000);
   lcd.setCursor(0,0);
-  for(int i=0;i<20*4;i++){
-    lcd.print(" ");
-    delay(10);
+  for(int i=0;i<20;i++){
+    for(int j=0;j<4;j++){
+      lcd.setCursor(i,j);
+      lcd.print(" ");
+    }
+    delay(20);
   }
   LCDStartDone=1;
+
+  lcd.clear();
+  for(int i=0;i<4;i++){
+    lcd.setCursor(0, i);
+    lcd.print(LCDcontent[i]);
+  }
 
   vTaskDelete(NULL);
 }
