@@ -1,3 +1,6 @@
+// return IPAddress(0U);        ==>  return IPAddress((uint32_t)0);
+// mbedtls_md5_starts(&_ctx);   ==>  mbedtls_md5_starts_ret(&_ctx);
+
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -19,14 +22,25 @@ IPAddress subnet(255, 255, 255, 0);
 #define SDA_PIN 5
 #define SCL_PIN 6
 
+struct Data {
+    bool detected;
+    float batt;
+    int day; // tu dodac strukture z node
+    int month;
+    int year;
+};
+
 TaskHandle_t task1;
 LiquidCrystal_I2C lcd(0x27,2,1,0,4,5,6,7,3,POSITIVE);
 AsyncWebServer server(80);
 uint httpIndex=0;
+Data receivedData={0,36.37,15,11,2023};
+// Data receivedData={0,0.0,0,0,0};
 
 // time control
 bool APrunning=0;
 bool LCDStartDone=0;
+bool acquiredData=0;
 
 // LCD
 char LCDcontent[4][21] = {
@@ -56,6 +70,7 @@ void setup() {
   // xTaskCreatePinnedToCore(serverConfig,"serverConfig",2048,nullptr,1,&task1,1 );
   
   xTaskCreatePinnedToCore(LCDStart,"LCDStart",1024,nullptr,1,&task1,1 );
+  xTaskCreatePinnedToCore(LCDCtrl,"LCDCtrl",1024,nullptr,1,&task1,1 );
 
 }
 
@@ -83,9 +98,55 @@ void LCDCtrl(void *parameter){
     }
   }
 
+  for(int i=0;i<4;i++){
+    if(!acquiredData){ // data not received yet
+      if(i==0){
+        lcd.setCursor(8,2);
+        lcd.print("   ");
+      }else{
+        lcd.setCursor(7+i,2);
+        lcd.print(".");
+      }
+      if(i>=3){
+        i=-1;
+        acquiredData=1; // TEMP
+      }
+
+      delay(1000);
+    }else{
+      break;
+    }
+  }
+
+  
+  if(receivedData.detected){
+    std::strcpy(LCDcontent[0], " Wykryto list!      ");
+  }else{
+    std::strcpy(LCDcontent[0], " Skrzynka pusta     ");
+  }
+  
+  String battStr="";
+  if((int)receivedData.batt>=100){
+    battStr = " Bateria: " + String((int)receivedData.batt) + String("%      ");
+  }else if((int)receivedData.batt>=10){
+    battStr = " Bateria: " + String((int)receivedData.batt) + String("%       ");
+  }else{
+    battStr = " Bateria: " + String((int)receivedData.batt) + String("%        ");
+  }
+  std::strcpy(LCDcontent[1], battStr.c_str());
+
+  std::strcpy(LCDcontent[2], " Ostatni list:      ");
+
+  std::strcpy(LCDcontent[3], "      14.11 12:34   ");
+
   lcd.clear();
   lcd.setCursor(0,0);
+  // tu menu glowne
   
+  for(int i=0;i<4;i++){
+    lcd.setCursor(0, i);
+    lcd.print(LCDcontent[i]);
+  }
   
 
   vTaskDelete(NULL);
@@ -117,13 +178,14 @@ void LCDStart(void *parameter){
     }
     delay(20);
   }
-  LCDStartDone=1;
 
   lcd.clear();
   for(int i=0;i<4;i++){
     lcd.setCursor(0, i);
     lcd.print(LCDcontent[i]);
   }
+
+  LCDStartDone=1;
 
   vTaskDelete(NULL);
 }
