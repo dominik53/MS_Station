@@ -1306,7 +1306,7 @@ void serverConfig(void *parameter){
             }
           }
           if(temp){
-            if(!updateTime){
+            if(!acquiredData){
               currentTime.seconds=receivedData.seconds;
               currentTime.minutes=receivedData.minutes;
               currentTime.hours=receivedData.hours;
@@ -1345,6 +1345,7 @@ void serverConfig(void *parameter){
           sendData.hours=currentTime.hours;
           sendData.minutes=currentTime.minutes;
           sendData.seconds=currentTime.seconds;
+          updateTime=0;
         }
         
         String updateMsg = String(sendData.day);
