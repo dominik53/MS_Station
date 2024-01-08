@@ -1,13 +1,16 @@
-// return IPAddress(0U);        ==>  return IPAddress((uint32_t)0);
-// mbedtls_md5_starts(&_ctx);   ==>  mbedtls_md5_starts_ret(&_ctx);
+/*
+  Dominik Kijak, 2024r.
+*/
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <Wire.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <LiquidCrystal_I2C.h>
+#include "Adafruit_FRAM_I2C.h"
 
 const char* ssid = "MS_Station";
 const char* password = "MS_Station2115";
@@ -22,32 +25,31 @@ IPAddress subnet(255, 255, 255, 0);
 #define SDA_PIN 5
 #define SCL_PIN 6
 
+#define MIN_CONNECT_TIME 10 // seconds
+#define MIN_WAKE_INTERVAL 300 // seconds
+const float detectPrecision = 0.975; // 0 - 1.0
+
 struct Data {
     bool detected;
+    float distance;
     float batt;
     int day;
     int month;
     int year;
     int hours;
     int minutes;
-    int seconds;
     int wakeInterval; // seconds
     int connectTime;  // seconds
 };
 
 struct UpdateData {
-    int day;
-    int month;
-    int year;
-    int hours;
-    int minutes;
     int wakeInterval; // seconds
     int connectTime;  // seconds
     bool calibrate;
-    int seconds;
 };
 
 struct TimeDate {
+    int milliseconds;
     int seconds;
     int minutes;
     int hours;
@@ -58,17 +60,19 @@ struct TimeDate {
 
 TaskHandle_t task1;
 LiquidCrystal_I2C lcd(0x27,2,1,0,4,5,6,7,3,POSITIVE);
+Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();
 AsyncWebServer server(80);
-Data receivedData={0,0.0,0,0,0,0,0,0,0,0};
-UpdateData sendData={-1,-1,-1,-1,-1,-1,-1,0,-1}; // -1 = do not update
-TimeDate currentTime={0,0,0,0,0,0};
+Data receivedData={0,0.0,0,MIN_WAKE_INTERVAL,MIN_CONNECT_TIME};
+UpdateData sendData={-1,-1,0}; // -1 = do not update
+TimeDate currentTime={0,0,0,0,1,1,2024};
 unsigned long startTime=0;
-// unsigned long updateDateTime=0;
+unsigned long lastTime=0;
+float ToFCalibratedDist=0; // mm
 
 // time control
 bool APrunning=0;
 bool acquiredData=0;
-bool acquiredDataPart[10]={0,0,0,0,0,0,0,0,0,0};
+bool acquiredDataPart[2]={0,0};
 
 // changeable variables in screens: 4,5,6
 int screenPointer4=0;
@@ -78,7 +82,6 @@ int screenVariables5[3]={0,6,0};
 int screenPointer6=0;
 int screenVariables6=10;
 bool updateRequest=0;
-bool updateTime=0;
 
 // LCD
 int currentScreen=0;
@@ -91,18 +94,12 @@ uint8_t customCharPointer[8] = {0,4,2,31,2,4,0,0}; // menu pointer
 uint8_t customCharC[8] = {2,4,14,16,16,17,14,0}; // ć
 uint8_t customCharArrowUp[8] = {4,14,21,4,4,4,0,0}; // arrow up
 uint8_t customCharArrowDown[8] = {0,0,4,4,4,21,14,4}; // arrow down
-
-void scanI2C(void *parameter);
-void serverConfig(void *parameter);
-void accessPointConfig(void *parameter);
-void displayScreen(int screenIndex);
-void calculateTime(void *parameter);
-
-/*
-  todo:
-  - mozliwosc zmiany kanalu AP
-  - edycja precyzji wykrywania
-*/
+        
+void serverConfig(void *parameter);         // configure HTTP server
+void accessPointConfig(void *parameter);    // configure and start AP
+void displayScreen(int screenIndex);        // LCD handler
+void calculateTime(void *parameter);        // control updating time related values
+void FRAMRead(void *parameter);             // read values from FRAM
 
 void setup() {
   Serial.begin(115200);
@@ -116,21 +113,20 @@ void setup() {
 
   Wire.begin(SDA_PIN,SCL_PIN);
   lcd.begin(20, 4);
-  lcd.createChar(0, customCharZ); // location 7 reserved
+  lcd.createChar(0, customCharZ); // location 7 reserved 
   lcd.createChar(1, customCharL);
   lcd.createChar(2, customCharA);
   lcd.createChar(3, customCharPointer);
   lcd.createChar(4, customCharC);
   lcd.createChar(5, customCharArrowDown);
   lcd.createChar(6, customCharArrowUp);
-  
 
-  // delay(5000);
+  xTaskCreatePinnedToCore(FRAMRead,"FRAMRead",2048,nullptr,1,&task1,1 );
   xTaskCreatePinnedToCore(accessPointConfig,"accessPointConfig",4096,nullptr,1,&task1,1 );
   xTaskCreatePinnedToCore(serverConfig,"serverConfig",2048,nullptr,1,&task1,1 );
   xTaskCreatePinnedToCore(calculateTime,"calculateTime",8192,nullptr,1,&task1,1 );
 
-  displayScreen(currentScreen++); // topic
+  displayScreen(currentScreen++); // welcome
   displayScreen(currentScreen++); // await for data
   displayScreen(currentScreen);   // info
 }
@@ -139,9 +135,9 @@ void loop() {
   if(digitalRead(SW0)==LOW){
     delay(50);
 
-    Serial.println("WCISNIETO.");
     sendData.wakeInterval=5;
     updateRequest=1;
+
     if(currentScreen==8){
       displayScreen(currentScreen);
     }
@@ -150,7 +146,6 @@ void loop() {
       delay(50);
     }
   }
-
 
 
   if(digitalRead(SW_OK)==LOW){
@@ -185,8 +180,18 @@ void loop() {
           currentTime.hours=screenVariables4[3];
           currentTime.minutes=screenVariables4[4];
           currentTime.seconds=0;
-          updateTime=1;
-          updateRequest=1;
+          currentTime.milliseconds=0;
+
+          fram.write(0x01, currentTime.month);
+          fram.write(0x02, currentTime.day);
+          uint8_t tempBuffer1[2];
+          tempBuffer1[0] = currentTime.year & 0xFF;
+          tempBuffer1[1] = (currentTime.year >> 8) & 0xFF;
+          fram.write(0x03, tempBuffer1, 2);
+
+          fram.write(0x05, currentTime.hours);
+          fram.write(0x06, currentTime.minutes);
+          fram.write(0x07, currentTime.seconds);
 
           screenPointer4=0;
           currentScreen=2;
@@ -201,6 +206,7 @@ void loop() {
           displayScreen(currentScreen);
         }else{
           sendData.wakeInterval=60*(screenVariables5[0]+60*(screenVariables5[1]+screenVariables5[2]*24));
+          receivedData.wakeInterval=sendData.wakeInterval;
           updateRequest=1;
 
           screenPointer5=0;
@@ -216,6 +222,7 @@ void loop() {
           displayScreen(currentScreen);
         }else{
           sendData.connectTime=screenVariables6;
+          receivedData.connectTime=sendData.connectTime;
           updateRequest=1;
 
           screenPointer6=0;
@@ -513,149 +520,94 @@ void loop() {
 
 
 void calculateTime(void *parameter){
+  lastTime=0;
+  startTime=millis();
+
+  bool changeSec=0;
+  bool changeMin=0;
+  bool changeHour=0;
+  bool changeDay=0;
+  bool changeMonth=0;
+  bool changeYear=0;
+
   for(;;){
-    for(;;){
-      if(acquiredData){
-        break;
-      }else{
-        delay(100);
-      }
-    }
-
     bool changeHappened=0;
-    unsigned long checkTime = millis();
-    unsigned long addTime = checkTime - startTime;
-    startTime=millis();
-    addTime=round(addTime/(1000)); //seconds
+    unsigned long checkTime=millis();
+    unsigned long elapsedTime=0;
+    if(checkTime<lastTime){
+      elapsedTime=checkTime;
+    }else{
+      elapsedTime=checkTime-lastTime;
+    }
 
-    for(;;){ // calc years
-      if(addTime>=31556926){
-        changeHappened=1;
-        currentTime.year++;
-        addTime-=31556926;
-      }else{
-        break;
-      }
-    }
-    for(;;){ // calc months
-      if(addTime>=2592000){
-        if(currentTime.month<12){
-          currentTime.month++;
-        }else{
-          currentTime.month=1;
-          currentTime.year++;
-        }
-        addTime-=2592000;
-      }else{
-        break;
-      }
-    }
-    for(;;){ // calc days
-      if(addTime>=86400){
-        changeHappened=1;
-        if((currentTime.day<31 && (currentTime.month==1 || currentTime.month==3 || currentTime.month==5 || currentTime.month==7 || currentTime.month==8 || currentTime.month==10 || currentTime.month==12)) || (currentTime.day<30 && (currentTime.month==4 || currentTime.month==6 || currentTime.month==9 || currentTime.month==11)) || (currentTime.day<28 && currentTime.month==2)){
-          currentTime.day++;
-        }else{
-          currentTime.day=1;
-          if(currentTime.month<12){
-            currentTime.month++;
-          }else{
-            currentTime.month=1;
-            currentTime.year++;
-          }
-        }
-        addTime-=86400;
-      }else{
-        break;
-      }
-    }
-    for(;;){ // calc hours
-      if(addTime>=3600){
-        changeHappened=1;
-        if(currentTime.hours<23){
-          currentTime.hours++;
-        }else{
-          currentTime.hours=0;
-          if((currentTime.day<31 && (currentTime.month==1 || currentTime.month==3 || currentTime.month==5 || currentTime.month==7 || currentTime.month==8 || currentTime.month==10 || currentTime.month==12)) || (currentTime.day<30 && (currentTime.month==4 || currentTime.month==6 || currentTime.month==9 || currentTime.month==11)) || (currentTime.day<28 && currentTime.month==2)){
-            currentTime.day++;
-          }else{
-            currentTime.day=1;
-            if(currentTime.month<12){
-              currentTime.month++;
-            }else{
+    currentTime.milliseconds+=elapsedTime;
+    while(currentTime.milliseconds>1000){
+      changeSec=1;
+      currentTime.seconds+=1;
+      currentTime.milliseconds-=1000;
+      if(currentTime.seconds>60){
+        changeMin=1;
+        currentTime.minutes+=1;
+        currentTime.seconds-=60;
+        if(currentTime.minutes>60){
+          changeHour=1;
+          changeHappened=1;
+          currentTime.hours+=1;
+          currentTime.minutes-=60;
+          if(currentTime.hours>24){
+            changeDay=1;
+            currentTime.day+=1;
+            currentTime.hours-=24;
+            if(currentTime.day==31 && (currentTime.month==1 || currentTime.month==3 || currentTime.month==5 || currentTime.month==7 || currentTime.month==8 || currentTime.month==10 || currentTime.month==12)){
+              changeMonth=1;
+              currentTime.day=1;
+              currentTime.month+=1;
+            }else if(currentTime.day==30 && (currentTime.month==4 || currentTime.month==6 || currentTime.month==9 || currentTime.month==11)){
+              changeMonth=1;
+              currentTime.day=1;
+              currentTime.month+=1;
+            }else if(currentTime.day==28 && currentTime.month==2){
+              changeMonth=1;
+              currentTime.day=1;
+              currentTime.month+=1;
+            }
+            if(currentTime.month>12){
+              changeYear=1;
+              currentTime.year+=1;
               currentTime.month=1;
-              currentTime.year++;
             }
           }
         }
-        addTime-=3600;
-      }else{
-        break;
       }
     }
-    for(;;){ // calc minutes
-      if(addTime>=60){
-        changeHappened=1;
-        if(currentTime.minutes<59){
-          currentTime.minutes++;
-        }else{
-          currentTime.minutes=0;
-          if(currentTime.hours<23){
-            currentTime.hours++;
-          }else{
-            currentTime.hours=0;
-            if((currentTime.day<31 && (currentTime.month==1 || currentTime.month==3 || currentTime.month==5 || currentTime.month==7 || currentTime.month==8 || currentTime.month==10 || currentTime.month==12)) || (currentTime.day<30 && (currentTime.month==4 || currentTime.month==6 || currentTime.month==9 || currentTime.month==11)) || (currentTime.day<28 && currentTime.month==2)){
-              currentTime.day++;
-            }else{
-              currentTime.day=1;
-              if(currentTime.month<12){
-                currentTime.month++;
-              }else{
-                currentTime.month=1;
-                currentTime.year++;
+
+    if(changeSec){
+      fram.write(0x07, currentTime.seconds);
+      if(changeMin){
+        fram.write(0x06, currentTime.minutes);
+        if(changeHour){
+          fram.write(0x05, currentTime.hours);
+          if(changeDay){
+            fram.write(0x02, currentTime.day);
+            if(changeMonth){
+              fram.write(0x01, currentTime.month);
+              if(changeYear){
+                uint8_t tempBuffer[2];
+                tempBuffer[0] = currentTime.year & 0xFF;
+                tempBuffer[1] = (currentTime.year >> 8) & 0xFF;
+                fram.write(0x03, tempBuffer, 2);
               }
             }
           }
         }
-        addTime-=60;
-      }else{
-        break;
       }
-    }
-    
-    // calc seconds
-    if(currentTime.seconds+addTime>=60){
-      changeHappened=1;
-      currentTime.seconds=currentTime.seconds+addTime-60;
-      if(currentTime.minutes<59){
-        currentTime.minutes++;
-      }else{
-        currentTime.minutes=0;
-        if(currentTime.hours<23){
-          currentTime.hours++;
-        }else{
-          currentTime.hours=0;
-          if((currentTime.day<31 && (currentTime.month==1 || currentTime.month==3 || currentTime.month==5 || currentTime.month==7 || currentTime.month==8 || currentTime.month==10 || currentTime.month==12)) || (currentTime.day<30 && (currentTime.month==4 || currentTime.month==6 || currentTime.month==9 || currentTime.month==11)) || (currentTime.day<28 && currentTime.month==2)){
-            currentTime.day++;
-          }else{
-            currentTime.day=1;
-            if(currentTime.month<12){
-              currentTime.month++;
-            }else{
-              currentTime.month=1;
-              currentTime.year++;
-            }
-          }
-        }
-      }
-    }else{
-      currentTime.seconds+=addTime;
     }
 
-    if(currentScreen==8 && changeHappened){
+    if(changeHappened && currentScreen==8){
       displayScreen(currentScreen);
     }
 
+    lastTime=checkTime;
     delay(1000);
   }
 
@@ -822,9 +774,9 @@ void displayScreen(int screenIndex){
       };
 
 
-      if(menuPointer>=menuFirstRow+4){ // jesli pointer pod ekranem
+      if(menuPointer>=menuFirstRow+4){ // if pointer above screen
         menuFirstRow++;
-      }else if(menuPointer<menuFirstRow){ // jesli nad ekranem
+      }else if(menuPointer<menuFirstRow){ // if under
         menuFirstRow--;
       }
 
@@ -1053,47 +1005,26 @@ void displayScreen(int screenIndex){
         // "    xx.xx.xxxx xx:xx"
 
       String tempVariable1=" Wybudzanie: ";
-      if(sendData.wakeInterval!=-1){
-        if(sendData.wakeInterval>9999){
-          tempVariable1 += String(sendData.wakeInterval) + " s";
-        }else if(sendData.wakeInterval>999){
-          tempVariable1 += "0" + String(sendData.wakeInterval) + " s";
-        }else if(sendData.wakeInterval>99){
-          tempVariable1 += "00" + String(sendData.wakeInterval) + " s";
-        }else if(sendData.wakeInterval>9){
-          tempVariable1 += "000" + String(sendData.wakeInterval) + " s";
-        }else{
-          tempVariable1 += "0000" + String(sendData.wakeInterval) + " s";
-        }
+      
+      if(receivedData.wakeInterval>9999){
+        tempVariable1 += String(receivedData.wakeInterval) + " s";
+      }else if(receivedData.wakeInterval>999){
+        tempVariable1 += "0" + String(receivedData.wakeInterval) + " s";
+      }else if(receivedData.wakeInterval>99){
+        tempVariable1 += "00" + String(receivedData.wakeInterval) + " s";
+      }else if(receivedData.wakeInterval>9){
+        tempVariable1 += "000" + String(receivedData.wakeInterval) + " s";
       }else{
-        if(receivedData.wakeInterval>9999){
-          tempVariable1 += String(receivedData.wakeInterval) + " s";
-        }else if(receivedData.wakeInterval>999){
-          tempVariable1 += "0" + String(receivedData.wakeInterval) + " s";
-        }else if(receivedData.wakeInterval>99){
-          tempVariable1 += "00" + String(receivedData.wakeInterval) + " s";
-        }else if(receivedData.wakeInterval>9){
-          tempVariable1 += "000" + String(receivedData.wakeInterval) + " s";
-        }else{
-          tempVariable1 += "0000" + String(receivedData.wakeInterval) + " s";
-        }
+        tempVariable1 += "0000" + String(receivedData.wakeInterval) + " s";
       }
       std::strcpy(LCDcontent[0], tempVariable1.c_str());
 
 
       String tempVariable2=" Polaczenie: ";
-      if(sendData.connectTime!=-1){
-        if(sendData.connectTime>9){
-          tempVariable2 += String(sendData.connectTime) + "    s";
-        }else{
-          tempVariable2 += "0" + String(sendData.connectTime) + "    s";
-        }
+      if(receivedData.connectTime>9){
+        tempVariable2 += String(receivedData.connectTime) + "    s";
       }else{
-        if(receivedData.connectTime>9){
-          tempVariable2 += String(receivedData.connectTime) + "    s";
-        }else{
-          tempVariable2 += "0" + String(receivedData.connectTime) + "    s";
-        }
+        tempVariable2 += "0" + String(receivedData.connectTime) + "    s";
       }
       std::strcpy(LCDcontent[1], tempVariable2.c_str());
 
@@ -1151,6 +1082,111 @@ void displayScreen(int screenIndex){
 }
 
 /////////////////////////////////
+
+void FRAMRead(void *parameter){
+  if (!fram.begin(0x50)) {
+    for(;;){
+      Serial.println("I2C FRAM not identified");
+      delay(1000);
+      if(fram.begin(0x50)) break;
+    }
+  }
+  Serial.println("I2C FRAM CONNECTED");
+  
+  /*
+    FRAM Memory:
+      
+    0x00 
+    0x01 month
+    0x02 date
+    0x03 year[0]
+    0x04 year[1]
+
+    0x05 hours
+    0x06 minutes
+    0x07 seconds
+
+    0x08 calibratedDist[0]
+    0x09 calibratedDist[1]
+    0x0a calibratedDist[2]
+    0x0b calibratedDist[3]
+    0x0c wakeInterval[0]
+    0x0d wakeInterval[1]
+    0x0e wakeInterval[2]
+    0x0f wakeInterval[3]
+    0x10 connectTime[0]
+    0x11 connectTime[1]
+    0x12 connectTime[2]
+    0x13 connectTime[3]
+
+    0x14 last connection: day
+    0x15 last connection: month
+    0x16 last connection: year[0]
+    0x17 last connection: year[1]
+    0x18 last connection: minutes
+    0x19 last connection: hours
+
+    0x1a batt[0]
+    0x1b batt[0]
+    0x1c batt[0]
+    0x1d batt[0]
+  */
+
+  currentTime.month=fram.read(0x01);
+  currentTime.day=fram.read(0x02);
+  uint8_t tempBuffer[2];
+  if(fram.read(0x03,tempBuffer,2)){
+    currentTime.year=(tempBuffer[1] << 8) | tempBuffer[0];
+  }else{
+    currentTime.year=0;
+  }
+
+  currentTime.hours=fram.read(0x05);
+  currentTime.minutes=fram.read(0x06);
+  currentTime.seconds=fram.read(0x07);
+
+  uint8_t tempBuffer2[4];
+  if(fram.read(0x08,tempBuffer2,4)){
+    ToFCalibratedDist=(tempBuffer2[3] << 24) | (tempBuffer2[2] << 16) | (tempBuffer2[1] << 8) | tempBuffer2[0];
+  }
+  Serial.print("FRAM calibrated dist: ");
+  Serial.println(ToFCalibratedDist);
+
+
+  if(fram.read(0x0c,tempBuffer2,4)){
+    receivedData.wakeInterval=(tempBuffer2[3] << 24) | (tempBuffer2[2] << 16) | (tempBuffer2[1] << 8) | tempBuffer2[0];
+  }
+  Serial.print("Wake up interval: ");
+  Serial.println(receivedData.wakeInterval);
+
+  if(fram.read(0x10,tempBuffer2,4)){
+    receivedData.connectTime=(tempBuffer2[3] << 24) | (tempBuffer2[2] << 16) | (tempBuffer2[1] << 8) | tempBuffer2[0];
+  }
+  Serial.print("Connect time: ");
+  Serial.println(receivedData.connectTime);
+
+  uint8_t tempBuffer3[4];
+  fram.read(0x1a, tempBuffer3, 4);
+  memcpy(&receivedData.batt, tempBuffer3, sizeof(float));
+
+  //last connection data
+  receivedData.hours=fram.read(0x19);
+  receivedData.minutes=fram.read(0x18);
+
+  uint8_t tempBuffer1[2];
+  if(fram.read(0x16,tempBuffer1,2)){
+    receivedData.year=(tempBuffer1[1] << 8) | tempBuffer1[0];
+  }else{
+    receivedData.year=0;
+  }
+
+  receivedData.month=fram.read(0x15);
+  receivedData.day=fram.read(0x14);
+
+
+  acquiredData=1;
+  vTaskDelete(NULL);
+}
 
 
 // Set up AP
@@ -1213,118 +1249,70 @@ void serverConfig(void *parameter){
       });
 
       server.on("/post", HTTP_POST, [](AsyncWebServerRequest *request){
-          String messageDetected, messageBatt, messageDay, messageMonth, messageYear, messageHours, messageMinutes, messageSeconds, messageConTime, messageWakeInterval;
+          String messageDistance, messageBatt;
 
-          if (request->hasParam("messageDetected", true)) {
-              messageDetected = request->getParam("messageDetected", true)->value();
+          if (request->hasParam("messageDistance", true)) {
+              messageDistance = request->getParam("messageDistance", true)->value();
               acquiredDataPart[0]=1;
-              if(messageDetected[0]=='1'){
+              
+              receivedData.distance = atof(messageDistance.c_str());
+
+              if(sendData.calibrate){
+                ToFCalibratedDist=receivedData.distance;
+
+                uint8_t tempBuffer[4];
+                tempBuffer[0] = (int)round(ToFCalibratedDist) & 0xFF;
+                tempBuffer[1] = ((int)round(ToFCalibratedDist) >> 8) & 0xFF;
+                tempBuffer[2] = ((int)round(ToFCalibratedDist) >> 16) & 0xFF;
+                tempBuffer[3] = ((int)round(ToFCalibratedDist) >> 24) & 0xFF;
+                fram.write(0x08, tempBuffer, 4);
+              }
+              
+              if(receivedData.distance<ToFCalibratedDist*detectPrecision){
                 receivedData.detected=1;
               }else{
                 receivedData.detected=0;
               }
-          } else {
-              messageDetected = "0";
+
           }
 
           if (request->hasParam("messageBatt", true)) {
               messageBatt = request->getParam("messageBatt", true)->value();
               acquiredDataPart[1]=1;
-              receivedData.batt =  atof(messageBatt.c_str());
-          } else {
-              messageBatt = "0.0";
-          }
-
-          if (request->hasParam("messageDay", true)) {
-              messageDay = request->getParam("messageDay", true)->value();
-              acquiredDataPart[2]=1;
-              receivedData.day = atoi(messageDay.c_str());
-          } else {
-              messageDay = "0";
-          }
-
-          if (request->hasParam("messageMonth", true)) {
-              messageMonth = request->getParam("messageMonth", true)->value();
-              acquiredDataPart[3]=1;
-              receivedData.month = atoi(messageMonth.c_str());
-          } else {
-              messageMonth = "0";
-          }
-
-          if (request->hasParam("messageYear", true)) {
-              messageYear = request->getParam("messageYear", true)->value();
-              acquiredDataPart[4]=1;
-              receivedData.year = atoi(messageYear.c_str());
-          } else {
-              messageYear = "0";
-          }
-
-          if (request->hasParam("messageHours", true)) {
-              messageHours = request->getParam("messageHours", true)->value();
-              acquiredDataPart[5]=1;
-              receivedData.hours = atoi(messageHours.c_str());
-          } else {
-              messageHours = "0";
-          }
-
-          if (request->hasParam("messageMinutes", true)) {
-              messageMinutes = request->getParam("messageMinutes", true)->value();
-              acquiredDataPart[6]=1;
-              receivedData.minutes = atoi(messageMinutes.c_str());
-          } else {
-              messageMinutes = "0";
-          }
-
-          if (request->hasParam("messageSeconds", true)) {
-              messageSeconds = request->getParam("messageSeconds", true)->value();
-              acquiredDataPart[7]=1;
-              receivedData.seconds = atoi(messageSeconds.c_str());
-          } else {
-              messageSeconds = "0";
-          }
-
-          if (request->hasParam("messageConTime", true)) {
-              messageConTime = request->getParam("messageConTime", true)->value();
-              acquiredDataPart[8]=1;
-              receivedData.connectTime = atoi(messageConTime.c_str());
-          } else {
-              messageConTime = "0";
-          }
-
-          if (request->hasParam("messageWakeInterval", true)) {
-              messageWakeInterval = request->getParam("messageWakeInterval", true)->value();
-              acquiredDataPart[9]=1;
-              receivedData.wakeInterval = atoi(messageWakeInterval.c_str());
-          } else {
-              messageWakeInterval = "0";
+              receivedData.batt = atof(messageBatt.c_str());
           }
 
           bool temp=1;
-          for(int i=0;i<10;i++){
+          for(int i=0;i<2;i++){
             if(!acquiredDataPart[i]){
               temp=0;
             }
           }
           if(temp){
-            if(!acquiredData){
-              currentTime.seconds=receivedData.seconds;
-              currentTime.minutes=receivedData.minutes;
-              currentTime.hours=receivedData.hours;
-              currentTime.day=receivedData.day;
-              currentTime.month=receivedData.month;
-              currentTime.year=receivedData.year;
-              startTime = millis();
-            }
+            receivedData.minutes=currentTime.minutes;
+            receivedData.hours=currentTime.hours;
+            receivedData.day=currentTime.day;
+            receivedData.month=currentTime.month;
+            receivedData.year=currentTime.year;
 
-            if(acquiredData && currentScreen==2){
+            fram.write(0x14, receivedData.day);
+            fram.write(0x15, receivedData.month);
+            uint8_t tempBuffer1[2];
+            tempBuffer1[0] = receivedData.year & 0xFF;
+            tempBuffer1[1] = (receivedData.year >> 8) & 0xFF;
+            fram.write(0x16, tempBuffer1, 2);
+
+            fram.write(0x19, receivedData.hours);
+            fram.write(0x18, receivedData.minutes);
+
+            uint8_t tempBuffer[4];
+            memcpy(tempBuffer, &receivedData.batt, sizeof(float));
+            fram.write(0x1a, tempBuffer, 4);
+
+
+            if(currentScreen==2 || currentScreen==8){
               displayScreen(currentScreen);
             }
-
-            if(currentScreen==8){
-              displayScreen(currentScreen);
-            }
-
-            acquiredData=1;
           }else{
             request->send(201, "text/plain", "Error: send data in one frame");
           }
@@ -1338,57 +1326,27 @@ void serverConfig(void *parameter){
       });
 
       server.on("/sendUpdate", HTTP_GET, [](AsyncWebServerRequest *request){
-        if(updateTime){
-          sendData.day=currentTime.day;
-          sendData.month=currentTime.month;
-          sendData.year=currentTime.year;
-          sendData.hours=currentTime.hours;
-          sendData.minutes=currentTime.minutes;
-          sendData.seconds=currentTime.seconds;
-          updateTime=0;
-        }
-        
-        String updateMsg = String(sendData.day);
-        updateMsg += "," + String(sendData.month);
-        updateMsg += "," + String(sendData.year);
-        updateMsg += "," + String(sendData.hours);
-        updateMsg += "," + String(sendData.minutes);
-        updateMsg += "," + String(sendData.wakeInterval);
+        String updateMsg = String(sendData.wakeInterval);
         updateMsg += "," + String(sendData.connectTime);
         updateMsg += "," + String(sendData.calibrate);
-        updateMsg += "," + String(sendData.seconds);
 
-        request->send(200, "text/plain", updateMsg);
-      });
+        uint8_t tempBuffer[4];
+        tempBuffer[0] = (int)round(receivedData.wakeInterval) & 0xFF;
+        tempBuffer[1] = ((int)round(receivedData.wakeInterval) >> 8) & 0xFF;
+        tempBuffer[2] = ((int)round(receivedData.wakeInterval) >> 16) & 0xFF;
+        tempBuffer[3] = ((int)round(receivedData.wakeInterval) >> 24) & 0xFF;
+        fram.write(0x0c, tempBuffer, 4);
 
-      server.on("/updateReceived", HTTP_GET, [](AsyncWebServerRequest *request){
-        sendData={-1,-1,-1,-1,-1,-1,-1,0};
+        uint8_t tempBuffer1[4];
+        tempBuffer1[0] = (int)round(receivedData.connectTime) & 0xFF;
+        tempBuffer1[1] = ((int)round(receivedData.connectTime) >> 8) & 0xFF;
+        tempBuffer1[2] = ((int)round(receivedData.connectTime) >> 16) & 0xFF;
+        tempBuffer1[3] = ((int)round(receivedData.connectTime) >> 24) & 0xFF;
+        fram.write(0x10, tempBuffer1, 4);      
+
+        sendData.calibrate=0;
         updateRequest=0;
-
-        // if(currentScreen==8){
-        //   displayScreen(currentScreen);
-        // }
-
-        if(currentScreen!=4){
-          screenPointer4=0;
-          screenVariables4[0]=1;
-          screenVariables4[1]=1;
-          screenVariables4[2]=2023;
-          screenVariables4[3]=0;
-          screenVariables4[4]=0;
-        }
-        if(currentScreen!=5){
-          screenPointer5=0;
-          screenVariables5[0]=0;
-          screenVariables5[1]=6;
-          screenVariables5[2]=0;
-        }
-        if(currentScreen!=6){
-          screenPointer6=0;
-          screenVariables6=10;
-        }
-
-        request->send(200, "text/plain", "OK");
+        request->send(200, "text/plain", updateMsg);
       });
 
       server.onNotFound([](AsyncWebServerRequest *request){
@@ -1399,51 +1357,9 @@ void serverConfig(void *parameter){
 
       vTaskDelete(NULL);
     }else{
-      // Serial.println("HTTP waiting for AP...");
       delay(10);
     }
   }
 
-  vTaskDelete(NULL);
-}
-
-// Find I2C devices
-void scanI2C(void *parameter){
-  for(;;){
-    byte error, address;
-    int nDevices;
-  
-    Serial.println("Scanning...");
-    nDevices = 0;
-    for(address = 1; address < 127; address++ )
-    {
-      Wire.beginTransmission(address);
-      error = Wire.endTransmission();
-  
-      if (error == 0)
-      {
-        Serial.print("I2C device found at address 0x");
-        if (address<16)
-          Serial.print("0");
-        Serial.print(address,HEX);
-        Serial.println("  !");
-  
-        nDevices++;
-      }
-      else if (error==4)
-      {
-        Serial.print("Unknown error at address 0x");
-        if (address<16)
-          Serial.print("0");
-        Serial.println(address,HEX);
-      }    
-    }
-    if (nDevices == 0)
-      Serial.println("No I2C devices found\n");
-    else
-      Serial.println("done\n");
-  
-    delay(5000);
-  }
   vTaskDelete(NULL);
 }
