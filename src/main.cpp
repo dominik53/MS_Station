@@ -27,7 +27,7 @@ IPAddress subnet(255, 255, 255, 0);
 
 #define MIN_CONNECT_TIME 10 // seconds
 #define MIN_WAKE_INTERVAL 300 // seconds
-const float detectPrecision = 0.975; // 0 - 1.0
+const float detectPrecision = 0.965; // 0 - 1.0
 
 struct Data {
     bool detected;
@@ -132,10 +132,11 @@ void setup() {
 }
 
 void loop() {
-  if(digitalRead(SW0)==LOW){
+  if(digitalRead(SW0)==LOW){ // only for presentation
     delay(50);
 
     sendData.wakeInterval=5;
+    receivedData.wakeInterval=5;
     updateRequest=1;
 
     if(currentScreen==8){
@@ -1127,9 +1128,9 @@ void FRAMRead(void *parameter){
     0x19 last connection: hours
 
     0x1a batt[0]
-    0x1b batt[0]
-    0x1c batt[0]
-    0x1d batt[0]
+    0x1b batt[1]
+    0x1c batt[2]
+    0x1d batt[3]
   */
 
   currentTime.month=fram.read(0x01);
